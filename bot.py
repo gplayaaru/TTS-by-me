@@ -10,7 +10,10 @@ Discord Hindi/English TTS bot (free: edge-tts, no paid API).
 import asyncio
 import ctypes.util
 import importlib.metadata
+import base64
 import json
+import urllib.error
+import urllib.request
 import os
 import re
 import shutil
@@ -101,7 +104,89 @@ def save_user_words() -> None:
         print(f"[dictionary] save failed: {e!r}")
 
 
+# ---------------------------------------------------------------------------
+# GitHub sync for /dictionary words.
+# Words added in Discord are pushed to user_words.json in the fork repo
+# gplayaaru/TTS-by-me (public), so they survive a Render restart/redeploy.
+# Needs a GitHub token with contents:write on that repo, set in Render as
+# env var GITHUB_TOKEN. Without it, words still work in this session and
+# in user_words.json on disk, but are not backed up to GitHub.
+# The live bot also loads user_words.json from GitHub raw on startup,
+# so a word pushed from Discord comes back after a restart.
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_WORDS_REPO = os.environ.get("GITHUB_WORDS_REPO", "gplayaaru/TTS-by-me")
+GITHUB_WORDS_BRANCH = os.environ.get("GITHUB_WORDS_BRANCH", "main")
+GITHUB_WORDS_PATH = "user_words.json"
+
+
+def _github_request(method, url, body=None):
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "tts-by-me-dictionary-bot")
+    if GITHUB_TOKEN:
+        req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    if data:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, data=data, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def load_user_words_from_github() -> int:
+    """Fetch user_words.json from GitHub raw, merge into WORD_MAP. Returns count, 0 on any failure."""
+    url = f"https://raw.githubusercontent.com/{GITHUB_WORDS_REPO}/{GITHUB_WORDS_BRANCH}/{GITHUB_WORDS_PATH}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    n = 0
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            USER_WORDS[k.lower()] = v
+            WORD_MAP[k.lower()] = v
+            n += 1
+    return n
+
+
+def sync_user_words_to_github(action: str) -> str:
+    """Push the current USER_WORDS to user_words.json in the fork repo.
+    Returns 'ok', 'no_token' or 'failed: ...' — never raises."""
+    if not GITHUB_TOKEN:
+        return "no_token"
+    try:
+        content = json.dumps(USER_WORDS, ensure_ascii=False, indent=2, sort_keys=True)
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        api = f"https://api.github.com/repos/{GITHUB_WORDS_REPO}/contents/{GITHUB_WORDS_PATH}"
+        sha = None
+        try:
+            existing = _github_request("GET", api + f"?ref={GITHUB_WORDS_BRANCH}")
+            sha = existing.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        body = {
+            "message": f"Dictionary: {action}",
+            "content": b64,
+            "branch": GITHUB_WORDS_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        _github_request("PUT", api, body)
+        return "ok"
+    except Exception as e:
+        print(f"[dictionary] github sync failed: {e!r}")
+        return f"failed: {e}"
+
+
 load_user_words()
+# GitHub copy wins over the local file when both exist (it is the backup).
+_gh_count = load_user_words_from_github()
+if _gh_count:
+    print(f"[dictionary] loaded {_gh_count} words from GitHub")
 
 _local_ffmpeg = BASE_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFMPEG = os.getenv("FFMPEG_PATH", "").strip() or (
@@ -1058,11 +1143,16 @@ async def dict_add(ctx: discord.ApplicationContext, word: str, meaning: str):
     WORD_MAP[word] = meaning
     USER_WORDS[word] = meaning
     save_user_words()
+    sync = sync_user_words_to_github(f"add {word}")
+    if sync == "ok":
+        note = "GitHub pe bhi save ho gaya, restart ke baad bhi rahega."
+    elif sync == "no_token":
+        note = "⚠️ GitHub sync abhi off hai (Render me GITHUB_TOKEN nahi hai) — word abhi chalega, par restart pe chala jayega."
+    else:
+        note = f"⚠️ GitHub sync fail ho gaya ({sync}) — word abhi chalega, `/dictionary list` se list mujhe bhej dena."
     await ctx.respond(
         f"✅ Added: **{word}** → **{meaning}**\n"
-        f"Ab se bot `{word}` ko `{meaning}` bolega. "
-        f"Permanent rakhne ke liye `/dictionary list` se ye list mujhe bhej dena, "
-        f"main GitHub wali dictionary me daal dunga."
+        f"Ab se bot `{word}` ko `{meaning}` bolega. {note}"
     )
 
 
@@ -1090,7 +1180,24 @@ async def dict_remove(ctx: discord.ApplicationContext, word: str):
         return await ctx.respond(f"❌ `{word}` Discord se add nahi hua tha (built-in word hai to remove nahi hota).")
     del USER_WORDS[word]
     save_user_words()
+    sync_user_words_to_github(f"remove {word}")
     await ctx.respond(f"✅ Removed: **{word}**. Ab wo phonetic fallback se bolega.")
+
+
+@dict_group.command(name="sync", description="Push Discord words to GitHub / pull words from GitHub")
+async def dict_sync(ctx: discord.ApplicationContext):
+    perms = getattr(ctx.author, "guild_permissions", None)
+    is_owner = ctx.guild is not None and ctx.author.id == ctx.guild.owner_id
+    if ctx.guild is not None and not is_owner and not (perms and perms.manage_guild):
+        return await ctx.respond("❌ Only the server owner / admins can sync.")
+    pulled = load_user_words_from_github()
+    save_user_words()
+    pushed = sync_user_words_to_github("sync")
+    await ctx.respond(
+        f"GitHub se {pulled} words liye, "
+        f"GitHub pe push: {'✅ ho gaya' if pushed == 'ok' else '⚠️ ' + pushed}. "
+        f"Total user words: {len(USER_WORDS)}."
+    )
 
 
 # --------------------------------------------------------------------------
