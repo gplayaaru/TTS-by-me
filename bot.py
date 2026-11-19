@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -59,6 +60,12 @@ PREFIX = "!"
 MAX_CHARS = 280
 MAX_QUEUE = 20
 DAVE_WAIT_SECONDS = 15.0
+# Idle fix: Discord/Render can drop the UDP media path after a few
+# minutes of silence even though the websocket stays connected and
+# /diag still shows can_encrypt=True. A 1s silent Opus packet every
+# 90s keeps that path alive. If the client is gone, reconnect instead.
+KEEPALIVE_INTERVAL_SECONDS = 90.0
+KEEPALIVE_SILENCE_SECONDS = 1
 LAST_TTS = BASE_DIR / "last_tts.mp3"
 
 _local_ffmpeg = BASE_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
@@ -230,6 +237,10 @@ class GuildState:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE)
         self.worker = None
         self.text_channel_id = None
+        self.voice_channel_id = None
+        self.last_spoke = 0.0
+        self.keepalive_task = None
+        self.keepalive_count = 0
         self.mode = "auto"
         self.style = "default"
         self.play_lock = asyncio.Lock()
@@ -485,6 +496,93 @@ def tone_sources():
     return make_opus, make_pcm
 
 
+def silence_sources():
+    """1s of silent audio, only to keep the voice UDP path alive."""
+    spec = "anullsrc=r=48000:cl=stereo"
+
+    def make_opus():
+        return discord.FFmpegOpusAudio(
+            spec, executable=FFMPEG,
+            before_options=f"-f lavfi -t {KEEPALIVE_SILENCE_SECONDS}",
+            options="-af volume=0",
+        )
+
+    def make_pcm():
+        return discord.FFmpegPCMAudio(
+            spec, executable=FFMPEG,
+            before_options=f"-f lavfi -t {KEEPALIVE_SILENCE_SECONDS}",
+            options="-af volume=0",
+        )
+
+    return make_opus, make_pcm
+
+
+async def reconnect_voice(guild, state) -> bool:
+    """Reconnect to the stored voice channel. Returns True if connected."""
+    if state.voice_channel_id is None:
+        return False
+    channel = guild.get_channel(state.voice_channel_id)
+    if channel is None:
+        return False
+    vc = guild.voice_client
+    if vc is not None:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+    try:
+        await connect_self_deaf(channel)
+    except Exception as e:
+        print(f"[keepalive] reconnect failed: {e!r}")
+        return False
+    state.dave_timed_out = False
+    print(f"[keepalive] reconnected to {channel}")
+    return True
+
+
+async def voice_keepalive_loop(guild_id: int):
+    """While in VC, send 1s silence every 90s so the media path survives idle."""
+    state = get_state(guild_id)
+    print(f"[keepalive] started for guild {guild_id}")
+    try:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                return
+            vc = guild.voice_client
+            if vc is None or not vc.is_connected():
+                print("[keepalive] voice client gone, trying reconnect")
+                if await reconnect_voice(guild, state):
+                    continue
+                return
+            if vc.is_playing():
+                continue
+            async with state.play_lock:
+                if vc.is_playing():
+                    continue
+                ok = await play_with_fallback(vc, *silence_sources())
+                state.keepalive_count += 1
+                state.last_spoke = time.time()
+                print(f"[keepalive] silent packet sent, ok={ok}, "
+                      f"latency={getattr(vc, 'latency', None)}")
+    except asyncio.CancelledError:
+        print(f"[keepalive] stopped for guild {guild_id}")
+        raise
+
+
+def ensure_keepalive(guild_id: int):
+    state = get_state(guild_id)
+    if state.keepalive_task is None or state.keepalive_task.done():
+        state.keepalive_task = asyncio.create_task(voice_keepalive_loop(guild_id))
+
+
+def stop_keepalive(state):
+    if state.keepalive_task is not None and not state.keepalive_task.done():
+        state.keepalive_task.cancel()
+    state.keepalive_task = None
+
+
 async def synthesize(text: str, voice: str) -> bool:
     for attempt in (1, 2):
         try:
@@ -529,6 +627,8 @@ async def tts_worker(guild_id: int):
                 async with state.play_lock:
                     make_opus, make_pcm = file_sources(str(LAST_TTS))
                     ok = await play_with_fallback(vc, make_opus, make_pcm)
+                    if ok:
+                        state.last_spoke = time.time()
                     if not ok:
                         print("[audio] Could not play this message.")
             except asyncio.CancelledError:
@@ -564,6 +664,7 @@ async def teardown(guild: discord.Guild, disconnect: bool = True) -> int:
     if state.worker is not None and not state.worker.done():
         state.worker.cancel()
     state.worker = None
+    stop_keepalive(state)
     if disconnect and vc is not None:
         try:
             await vc.disconnect(force=True)
@@ -603,11 +704,13 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
     state = get_state(guild.id)
     async with state.join_lock:
         state.text_channel_id = text_channel.id
+        state.voice_channel_id = channel.id
         vc = guild.voice_client
 
         if vc is not None and vc.is_connected():
             if vc.channel and vc.channel.id == channel.id:
                 ensure_worker(guild.id)
+                ensure_keepalive(guild.id)
                 return f"✅ I'm already in {channel.mention}."
             try:
                 await vc.move_to(channel)
@@ -617,6 +720,7 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
             except Exception as e:
                 return f"❌ Could not move to {channel.mention}: {e}"
             ensure_worker(guild.id)
+            ensure_keepalive(guild.id)
             return f"✅ Moved to {channel.mention}."
 
         if vc is not None:  # stale, half-open client
@@ -640,7 +744,9 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
             return f"❌ Could not join voice: {e}"
 
         state.dave_timed_out = False
+        state.last_spoke = time.time()
         ensure_worker(guild.id)
+        ensure_keepalive(guild.id)
         asyncio.create_task(log_dave_progress(vc))
         return (
             f"✅ Joined {channel.mention}. I'll read messages from people in this "
@@ -692,7 +798,10 @@ async def run_tone(guild, state, vc) -> bool:
     await wait_for_dave(vc, state)
     async with state.play_lock:
         make_opus, make_pcm = tone_sources()
-        return await play_with_fallback(vc, make_opus, make_pcm)
+        ok = await play_with_fallback(vc, make_opus, make_pcm)
+        if ok:
+            state.last_spoke = time.time()
+        return ok
 
 
 def pkg_version(*names) -> str:
@@ -731,6 +840,8 @@ def build_diag(guild) -> str:
         f"dave_version: {d['dave_version']}",
         f"max_dave: {d['max_dave']}",
         f"has_dave_session: {d['has_dave_session']}",
+        f"voice latency: {getattr(vc, 'latency', None) if connected else None}",
+        f"keepalives sent: {state.keepalive_count}",
         f"voice mode: {state.mode}",
         f"voice style: {state.style}",
         f"queue size: {state.queue.qsize()}",
@@ -972,6 +1083,7 @@ async def on_voice_state_update(member, before, after):
             if state.worker is not None and not state.worker.done():
                 state.worker.cancel()
             state.worker = None
+            stop_keepalive(state)
 
 
 # --------------------------------------------------------------------------
