@@ -241,6 +241,7 @@ class GuildState:
         self.voice_channel_id = None
         self.last_spoke = 0.0
         self.last_real_spoke = 0.0
+        self.reconnecting = False  # v3: our own keepalive reconnect, not a kick/leave
         self.keepalive_task = None
         self.keepalive_count = 0
         self.mode = "auto"
@@ -520,26 +521,39 @@ def silence_sources():
 
 
 async def reconnect_voice(guild, state) -> bool:
-    """Reconnect to the stored voice channel. Returns True if connected."""
+    """Reconnect to the stored voice channel. Returns True if connected.
+
+    v3: the disconnect fires on_voice_state_update for the bot itself,
+    which used to tear down the TTS worker + keepalive and clear the
+    queue — that is why v2's testtone worked (direct play) but queued
+    text never spoke. The reconnecting flag tells that handler to
+    leave the worker/queue alone, and we restart both here as a net.
+    """
     if state.voice_channel_id is None:
         return False
     channel = guild.get_channel(state.voice_channel_id)
     if channel is None:
         return False
-    vc = guild.voice_client
-    if vc is not None:
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
+    state.reconnecting = True
     try:
-        await connect_self_deaf(channel)
-    except Exception as e:
-        print(f"[keepalive] reconnect failed: {e!r}")
-        return False
-    state.dave_timed_out = False
-    print(f"[keepalive] reconnected to {channel}")
-    return True
+        vc = guild.voice_client
+        if vc is not None:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        try:
+            await connect_self_deaf(channel)
+        except Exception as e:
+            print(f"[keepalive] reconnect failed: {e!r}")
+            return False
+        state.dave_timed_out = False
+        print(f"[keepalive] reconnected to {channel}")
+        ensure_worker(guild.id)
+        ensure_keepalive(guild.id)
+        return True
+    finally:
+        state.reconnecting = False
 
 
 async def voice_keepalive_loop(guild_id: int):
@@ -1092,6 +1106,10 @@ async def on_voice_state_update(member, before, after):
     if before.channel is not None and after.channel is None:
         # The bot left voice (kicked, moved out, or /leave). Clean up quietly.
         state = states.get(member.guild.id)
+        if state and state.reconnecting:
+            # v3: this disconnect is our own keepalive reconnect — the
+            # worker, queue and keepalive must survive it.
+            return
         if state:
             state.generation += 1
             state.clear_queue()
