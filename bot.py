@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from roman_hindi import to_devanagari  # accent fix: Roman Hindi -> Devanagari
+
 def _keep_alive():
     port = int(os.environ.get("PORT", "10000"))
     class H(BaseHTTPRequestHandler):
@@ -179,6 +181,7 @@ HINDI_ROMAN_WORDS = {
     "koi", "lekin", "toh", "tha", "thi", "hoga", "hogi", "wala", "wali",
     "aur", "bhi", "apna", "apni", "unka", "uska", "iska", "kitna", "kitni",
     "kaha", "khana", "paani", "ghar", "dost", "samajh", "pata", "matlab",
+    "namaste",
 }
 
 
@@ -767,6 +770,17 @@ def check_can_speak(guild, member):
     return get_state(guild.id), vc, None
 
 
+def speak_text(text: str, lang: str) -> str:
+    """Accent fix: Roman Hindi ko Devanagari me badlo, taaki Hindi voice sahi bole.
+
+    Sirf tab jab lang hindi ho aur text me Devanagari pehle se na ho.
+    English messages ko kabhi convert nahi karta.
+    """
+    if lang == "hi" and not DEVANAGARI_RE.search(text):
+        return to_devanagari(text)
+    return text
+
+
 def build_item(raw: str, state: GuildState):
     prefix_lang, body = split_lang_prefix(raw)
     text = clean_text(body)
@@ -780,6 +794,9 @@ def build_item(raw: str, state: GuildState):
         lang = "en"
     else:
         lang = detect_language(text)
+    # Accent fix: single entry point — /say, !say and VC chat all go
+    # through build_item -> enqueue_text, so converting here covers all.
+    text = speak_text(text, lang)
     return text, lang
 
 
