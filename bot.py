@@ -10,7 +10,6 @@ Discord Hindi/English TTS bot (free: edge-tts, no paid API).
 import asyncio
 import ctypes.util
 import importlib.metadata
-import json
 import os
 import re
 import shutil
@@ -27,8 +26,6 @@ from dotenv import load_dotenv
 
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-from roman_hindi import WORD_MAP, to_devanagari  # accent fix: Roman Hindi -> Devanagari
 
 def _keep_alive():
     port = int(os.environ.get("PORT", "10000"))
@@ -67,41 +64,10 @@ DAVE_WAIT_SECONDS = 15.0
 # minutes of silence even though the websocket stays connected and
 # /diag still shows can_encrypt=True. A 1s silent Opus packet every
 # 90s keeps that path alive. If the client is gone, reconnect instead.
-KEEPALIVE_INTERVAL_SECONDS = 90.0
+KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
+RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
-USER_WORDS_FILE = BASE_DIR / "user_words.json"
-# Words added from Discord with /dictionary add. They work immediately,
-# and are saved to user_words.json so a bot restart on the same Render
-# instance keeps them. They are NOT permanent until they are also added
-# to roman_hindi.py WORD_MAP and deployed — use /dictionary list to
-# collect them for that commit.
-USER_WORDS: dict = {}
-
-
-def load_user_words() -> None:
-    try:
-        data = json.loads(USER_WORDS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, str):
-                USER_WORDS[k.lower()] = v
-                WORD_MAP[k.lower()] = v
-
-
-def save_user_words() -> None:
-    try:
-        USER_WORDS_FILE.write_text(
-            json.dumps(USER_WORDS, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"[dictionary] save failed: {e!r}")
-
-
-load_user_words()
 
 _local_ffmpeg = BASE_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFMPEG = os.getenv("FFMPEG_PATH", "").strip() or (
@@ -214,7 +180,6 @@ HINDI_ROMAN_WORDS = {
     "koi", "lekin", "toh", "tha", "thi", "hoga", "hogi", "wala", "wali",
     "aur", "bhi", "apna", "apni", "unka", "uska", "iska", "kitna", "kitni",
     "kaha", "khana", "paani", "ghar", "dost", "samajh", "pata", "matlab",
-    "namaste",
 }
 
 
@@ -275,6 +240,7 @@ class GuildState:
         self.text_channel_id = None
         self.voice_channel_id = None
         self.last_spoke = 0.0
+        self.last_real_spoke = 0.0
         self.keepalive_task = None
         self.keepalive_count = 0
         self.mode = "auto"
@@ -594,12 +560,22 @@ async def voice_keepalive_loop(guild_id: int):
                 return
             if vc.is_playing():
                 continue
+            # No real speech for 5 min: silent packets alone did not
+            # keep the media path alive (v1 proved that), so do a full
+            # disconnect + reconnect — fresh UDP + fresh DAVE session.
+            idle_for = time.time() - (state.last_real_spoke or state.last_spoke or time.time())
+            if idle_for >= RECONNECT_IDLE_SECONDS:
+                print(f"[keepalive] idle {idle_for:.0f}s, full reconnect")
+                async with state.play_lock:
+                    if await reconnect_voice(guild, state):
+                        state.last_real_spoke = time.time()
+                        state.last_spoke = time.time()
+                continue
             async with state.play_lock:
                 if vc.is_playing():
                     continue
                 ok = await play_with_fallback(vc, *silence_sources())
                 state.keepalive_count += 1
-                state.last_spoke = time.time()
                 print(f"[keepalive] silent packet sent, ok={ok}, "
                       f"latency={getattr(vc, 'latency', None)}")
     except asyncio.CancelledError:
@@ -665,6 +641,7 @@ async def tts_worker(guild_id: int):
                     ok = await play_with_fallback(vc, make_opus, make_pcm)
                     if ok:
                         state.last_spoke = time.time()
+                        state.last_real_spoke = time.time()
                     if not ok:
                         print("[audio] Could not play this message.")
             except asyncio.CancelledError:
@@ -781,6 +758,7 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
 
         state.dave_timed_out = False
         state.last_spoke = time.time()
+        state.last_real_spoke = time.time()
         ensure_worker(guild.id)
         ensure_keepalive(guild.id)
         asyncio.create_task(log_dave_progress(vc))
@@ -803,17 +781,6 @@ def check_can_speak(guild, member):
     return get_state(guild.id), vc, None
 
 
-def speak_text(text: str, lang: str) -> str:
-    """Accent fix: Roman Hindi ko Devanagari me badlo, taaki Hindi voice sahi bole.
-
-    Sirf tab jab lang hindi ho aur text me Devanagari pehle se na ho.
-    English messages ko kabhi convert nahi karta.
-    """
-    if lang == "hi" and not DEVANAGARI_RE.search(text):
-        return to_devanagari(text)
-    return text
-
-
 def build_item(raw: str, state: GuildState):
     prefix_lang, body = split_lang_prefix(raw)
     text = clean_text(body)
@@ -827,9 +794,6 @@ def build_item(raw: str, state: GuildState):
         lang = "en"
     else:
         lang = detect_language(text)
-    # Accent fix: single entry point — /say, !say and VC chat all go
-    # through build_item -> enqueue_text, so converting here covers all.
-    text = speak_text(text, lang)
     return text, lang
 
 
@@ -851,6 +815,7 @@ async def run_tone(guild, state, vc) -> bool:
         ok = await play_with_fallback(vc, make_opus, make_pcm)
         if ok:
             state.last_spoke = time.time()
+            state.last_real_spoke = time.time()
         return ok
 
 
@@ -1028,69 +993,6 @@ async def slash_testtone(ctx: discord.ApplicationContext):
             await ctx.followup.send("⚠️ Tone failed. Check /diag and the console.")
         except Exception:
             pass
-
-
-# --------------------------------------------------------------------------
-# /dictionary — add words from Discord (no GitHub needed for the session)
-# --------------------------------------------------------------------------
-dict_group = bot.create_group(
-    "dictionary", "Roman Hindi dictionary: add/list/remove words the bot should say right"
-)
-
-
-@dict_group.command(name="add", description="Add a Roman Hindi word: /dictionary add word: krna meaning: करना")
-async def dict_add(ctx: discord.ApplicationContext, word: str, meaning: str):
-    if ctx.guild is None:
-        return await ctx.respond("❌ This only works in a server.")
-    perms = getattr(ctx.author, "guild_permissions", None)
-    is_owner = ctx.author.id == ctx.guild.owner_id
-    if not is_owner and not (perms and perms.manage_guild):
-        return await ctx.respond("❌ Only the server owner / admins can add dictionary words.")
-    word = word.strip().lower()
-    meaning = meaning.strip()
-    if not word or not re.fullmatch(r"[a-z]+", word):
-        return await ctx.respond("❌ Word ek hi Roman Hindi word hona chahiye, sirf a-z, jaise `krna`.")
-    if not meaning:
-        return await ctx.respond("❌ Meaning bhi do, jaise `करना`.")
-    # Meaning Devanagari me ho to waisa hi rakho; Roman me likha ho to convert karo.
-    if not DEVANAGARI_RE.search(meaning):
-        meaning = to_devanagari(meaning.lower())
-    WORD_MAP[word] = meaning
-    USER_WORDS[word] = meaning
-    save_user_words()
-    await ctx.respond(
-        f"✅ Added: **{word}** → **{meaning}**\n"
-        f"Ab se bot `{word}` ko `{meaning}` bolega. "
-        f"Permanent rakhne ke liye `/dictionary list` se ye list mujhe bhej dena, "
-        f"main GitHub wali dictionary me daal dunga."
-    )
-
-
-@dict_group.command(name="list", description="Show words added from Discord with /dictionary add")
-async def dict_list(ctx: discord.ApplicationContext):
-    if not USER_WORDS:
-        return await ctx.respond("Dictionary me abhi koi naya word add nahi hua hai. `/dictionary add` se add karo.")
-    lines = [f"{k} → {v}" for k, v in sorted(USER_WORDS.items())]
-    text = "\n".join(lines)
-    if len(text) > 1800:
-        text = text[:1800] + "\n… (aur bhi hain)"
-    await ctx.respond(f"**Discord se add kiye gaye words ({len(USER_WORDS)}):**\n```\n{text}\n```")
-
-
-@dict_group.command(name="remove", description="Remove a word added with /dictionary add")
-async def dict_remove(ctx: discord.ApplicationContext, word: str):
-    if ctx.guild is None:
-        return await ctx.respond("❌ This only works in a server.")
-    perms = getattr(ctx.author, "guild_permissions", None)
-    is_owner = ctx.author.id == ctx.guild.owner_id
-    if not is_owner and not (perms and perms.manage_guild):
-        return await ctx.respond("❌ Only the server owner / admins can remove dictionary words.")
-    word = word.strip().lower()
-    if word not in USER_WORDS:
-        return await ctx.respond(f"❌ `{word}` Discord se add nahi hua tha (built-in word hai to remove nahi hota).")
-    del USER_WORDS[word]
-    save_user_words()
-    await ctx.respond(f"✅ Removed: **{word}**. Ab wo phonetic fallback se bolega.")
 
 
 # --------------------------------------------------------------------------
