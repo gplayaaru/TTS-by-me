@@ -64,8 +64,9 @@ DAVE_WAIT_SECONDS = 15.0
 # minutes of silence even though the websocket stays connected and
 # /diag still shows can_encrypt=True. A 1s silent Opus packet every
 # 90s keeps that path alive. If the client is gone, reconnect instead.
-KEEPALIVE_INTERVAL_SECONDS = 90.0
+KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
+RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
 
 _local_ffmpeg = BASE_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
@@ -239,6 +240,7 @@ class GuildState:
         self.text_channel_id = None
         self.voice_channel_id = None
         self.last_spoke = 0.0
+        self.last_real_spoke = 0.0
         self.keepalive_task = None
         self.keepalive_count = 0
         self.mode = "auto"
@@ -558,12 +560,22 @@ async def voice_keepalive_loop(guild_id: int):
                 return
             if vc.is_playing():
                 continue
+            # No real speech for 5 min: silent packets alone did not
+            # keep the media path alive (v1 proved that), so do a full
+            # disconnect + reconnect — fresh UDP + fresh DAVE session.
+            idle_for = time.time() - (state.last_real_spoke or state.last_spoke or time.time())
+            if idle_for >= RECONNECT_IDLE_SECONDS:
+                print(f"[keepalive] idle {idle_for:.0f}s, full reconnect")
+                async with state.play_lock:
+                    if await reconnect_voice(guild, state):
+                        state.last_real_spoke = time.time()
+                        state.last_spoke = time.time()
+                continue
             async with state.play_lock:
                 if vc.is_playing():
                     continue
                 ok = await play_with_fallback(vc, *silence_sources())
                 state.keepalive_count += 1
-                state.last_spoke = time.time()
                 print(f"[keepalive] silent packet sent, ok={ok}, "
                       f"latency={getattr(vc, 'latency', None)}")
     except asyncio.CancelledError:
@@ -629,6 +641,7 @@ async def tts_worker(guild_id: int):
                     ok = await play_with_fallback(vc, make_opus, make_pcm)
                     if ok:
                         state.last_spoke = time.time()
+                        state.last_real_spoke = time.time()
                     if not ok:
                         print("[audio] Could not play this message.")
             except asyncio.CancelledError:
@@ -745,6 +758,7 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
 
         state.dave_timed_out = False
         state.last_spoke = time.time()
+        state.last_real_spoke = time.time()
         ensure_worker(guild.id)
         ensure_keepalive(guild.id)
         asyncio.create_task(log_dave_progress(vc))
@@ -801,6 +815,7 @@ async def run_tone(guild, state, vc) -> bool:
         ok = await play_with_fallback(vc, make_opus, make_pcm)
         if ok:
             state.last_spoke = time.time()
+            state.last_real_spoke = time.time()
         return ok
 
 
