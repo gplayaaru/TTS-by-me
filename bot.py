@@ -9,7 +9,11 @@ Discord Hindi/English TTS bot (free: edge-tts, no paid API).
 
 import asyncio
 import ctypes.util
+import base64
 import importlib.metadata
+import json
+import urllib.error
+import urllib.request
 import os
 import re
 import shutil
@@ -68,6 +72,88 @@ KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
 RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
+
+# ---------------------------------------------------------------------------
+# GitHub sync for /dictionary words.
+# Words added in Discord are pushed to user_words.json in the fork repo
+# gplayaaru/TTS-by-me (public), so they survive a Render restart/redeploy.
+# Needs a GitHub token with contents:write on that repo, set in Render as
+# env var GITHUB_TOKEN. Without it, words still work in this session and
+# in user_words.json on disk, but are not backed up to GitHub.
+# The live bot also loads user_words.json from GitHub raw on startup,
+# so a word pushed from Discord comes back after a restart.
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_WORDS_REPO = os.environ.get("GITHUB_WORDS_REPO", "gplayaaru/TTS-by-me")
+GITHUB_WORDS_BRANCH = os.environ.get("GITHUB_WORDS_BRANCH", "main")
+GITHUB_WORDS_PATH = "user_words.json"
+
+
+def _github_request(method, url, body=None):
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "tts-by-me-dictionary-bot")
+    if GITHUB_TOKEN:
+        req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    if data:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, data=data, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def load_user_words_from_github() -> int:
+    """Fetch user_words.json from GitHub raw, merge into WORD_MAP. Returns count, 0 on any failure."""
+    url = f"https://raw.githubusercontent.com/{GITHUB_WORDS_REPO}/{GITHUB_WORDS_BRANCH}/{GITHUB_WORDS_PATH}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    n = 0
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            USER_WORDS[k.lower()] = v
+            WORD_MAP[k.lower()] = v
+            n += 1
+    return n
+
+
+def sync_user_words_to_github(action: str) -> str:
+    """Push the current USER_WORDS to user_words.json in the fork repo.
+    Returns 'ok', 'no_token' or 'failed: ...' — never raises."""
+    if not GITHUB_TOKEN:
+        return "no_token"
+    try:
+        content = json.dumps(USER_WORDS, ensure_ascii=False, indent=2, sort_keys=True)
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        api = f"https://api.github.com/repos/{GITHUB_WORDS_REPO}/contents/{GITHUB_WORDS_PATH}"
+        sha = None
+        try:
+            existing = _github_request("GET", api + f"?ref={GITHUB_WORDS_BRANCH}")
+            sha = existing.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        body = {
+            "message": f"Dictionary: {action}",
+            "content": b64,
+            "branch": GITHUB_WORDS_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        _github_request("PUT", api, body)
+        return "ok"
+    except Exception as e:
+        print(f"[dictionary] github sync failed: {e!r}")
+        return f"failed: {e}"
+
+
+_gh_count = load_user_words_from_github()
+if _gh_count:
+    print(f"[dictionary] loaded {_gh_count} words from GitHub")
 
 _local_ffmpeg = BASE_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFMPEG = os.getenv("FFMPEG_PATH", "").strip() or (
@@ -808,6 +894,9 @@ def build_item(raw: str, state: GuildState):
         lang = "en"
     else:
         lang = detect_language(text)
+        # Accent fix: single entry point — /say, !say and VC chat all go
+        # through build_item -> enqueue_text, so converting here covers all.
+        text = speak_text(text, lang)
     return text, lang
 
 
@@ -1007,6 +1096,91 @@ async def slash_testtone(ctx: discord.ApplicationContext):
             await ctx.followup.send("⚠️ Tone failed. Check /diag and the console.")
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------
+# /dictionary — add words from Discord (no GitHub needed for the session)
+# --------------------------------------------------------------------------
+dict_group = bot.create_group(
+    "dictionary", "Roman Hindi dictionary: add/list/remove words the bot should say right"
+)
+
+
+@dict_group.command(name="add", description="Add a Roman Hindi word: /dictionary add word: krna meaning: करना")
+async def dict_add(ctx: discord.ApplicationContext, word: str, meaning: str):
+    if ctx.guild is None:
+        return await ctx.respond("❌ This only works in a server.")
+    perms = getattr(ctx.author, "guild_permissions", None)
+    is_owner = ctx.author.id == ctx.guild.owner_id
+    if not is_owner and not (perms and perms.manage_guild):
+        return await ctx.respond("❌ Only the server owner / admins can add dictionary words.")
+    word = word.strip().lower()
+    meaning = meaning.strip()
+    if not word or not re.fullmatch(r"[a-z]+", word):
+        return await ctx.respond("❌ Word ek hi Roman Hindi word hona chahiye, sirf a-z, jaise `krna`.")
+    if not meaning:
+        return await ctx.respond("❌ Meaning bhi do, jaise `करना`.")
+    # Meaning Devanagari me ho to waisa hi rakho; Roman me likha ho to convert karo.
+    if not DEVANAGARI_RE.search(meaning):
+        meaning = to_devanagari(meaning.lower())
+    WORD_MAP[word] = meaning
+    USER_WORDS[word] = meaning
+    save_user_words()
+    sync = sync_user_words_to_github(f"add {word}")
+    if sync == "ok":
+        note = "GitHub pe bhi save ho gaya, restart ke baad bhi rahega."
+    elif sync == "no_token":
+        note = "⚠️ GitHub sync abhi off hai (Render me GITHUB_TOKEN nahi hai) — word abhi chalega, par restart pe chala jayega."
+    else:
+        note = f"⚠️ GitHub sync fail ho gaya ({sync}) — word abhi chalega, `/dictionary list` se list mujhe bhej dena."
+    await ctx.respond(
+        f"✅ Added: **{word}** → **{meaning}**\n"
+        f"Ab se bot `{word}` ko `{meaning}` bolega. {note}"
+    )
+
+
+@dict_group.command(name="list", description="Show words added from Discord with /dictionary add")
+async def dict_list(ctx: discord.ApplicationContext):
+    if not USER_WORDS:
+        return await ctx.respond("Dictionary me abhi koi naya word add nahi hua hai. `/dictionary add` se add karo.")
+    lines = [f"{k} → {v}" for k, v in sorted(USER_WORDS.items())]
+    text = "\n".join(lines)
+    if len(text) > 1800:
+        text = text[:1800] + "\n… (aur bhi hain)"
+    await ctx.respond(f"**Discord se add kiye gaye words ({len(USER_WORDS)}):**\n```\n{text}\n```")
+
+
+@dict_group.command(name="remove", description="Remove a word added with /dictionary add")
+async def dict_remove(ctx: discord.ApplicationContext, word: str):
+    if ctx.guild is None:
+        return await ctx.respond("❌ This only works in a server.")
+    perms = getattr(ctx.author, "guild_permissions", None)
+    is_owner = ctx.author.id == ctx.guild.owner_id
+    if not is_owner and not (perms and perms.manage_guild):
+        return await ctx.respond("❌ Only the server owner / admins can remove dictionary words.")
+    word = word.strip().lower()
+    if word not in USER_WORDS:
+        return await ctx.respond(f"❌ `{word}` Discord se add nahi hua tha (built-in word hai to remove nahi hota).")
+    del USER_WORDS[word]
+    save_user_words()
+    sync_user_words_to_github(f"remove {word}")
+    await ctx.respond(f"✅ Removed: **{word}**. Ab wo phonetic fallback se bolega.")
+
+
+@dict_group.command(name="sync", description="Push Discord words to GitHub / pull words from GitHub")
+async def dict_sync(ctx: discord.ApplicationContext):
+    perms = getattr(ctx.author, "guild_permissions", None)
+    is_owner = ctx.guild is not None and ctx.author.id == ctx.guild.owner_id
+    if ctx.guild is not None and not is_owner and not (perms and perms.manage_guild):
+        return await ctx.respond("❌ Only the server owner / admins can sync.")
+    pulled = load_user_words_from_github()
+    save_user_words()
+    pushed = sync_user_words_to_github("sync")
+    await ctx.respond(
+        f"GitHub se {pulled} words liye, "
+        f"GitHub pe push: {'✅ ho gaya' if pushed == 'ok' else '⚠️ ' + pushed}. "
+        f"Total user words: {len(USER_WORDS)}."
+    )
 
 
 # --------------------------------------------------------------------------
