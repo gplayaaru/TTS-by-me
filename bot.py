@@ -31,8 +31,6 @@ from dotenv import load_dotenv
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from roman_hindi import WORD_MAP, to_devanagari  # accent fix: Roman Hindi -> Devanagari
-
 def _keep_alive():
     port = int(os.environ.get("PORT", "10000"))
     class H(BaseHTTPRequestHandler):
@@ -74,38 +72,6 @@ KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
 RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
-USER_WORDS_FILE = BASE_DIR / "user_words.json"
-# Words added from Discord with /dictionary add. They work immediately,
-# and are saved to user_words.json so a bot restart on the same Render
-# instance keeps them. They are NOT permanent until they are also added
-# to roman_hindi.py WORD_MAP and deployed — use /dictionary list to
-# collect them for that commit.
-USER_WORDS: dict = {}
-
-
-def load_user_words() -> None:
-    try:
-        data = json.loads(USER_WORDS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, str):
-                USER_WORDS[k.lower()] = v
-                WORD_MAP[k.lower()] = v
-
-
-def save_user_words() -> None:
-    try:
-        USER_WORDS_FILE.write_text(
-            json.dumps(USER_WORDS, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"[dictionary] save failed: {e!r}")
-
-
-load_user_words()
 
 # ---------------------------------------------------------------------------
 # GitHub sync for /dictionary words.
@@ -300,7 +266,6 @@ HINDI_ROMAN_WORDS = {
     "koi", "lekin", "toh", "tha", "thi", "hoga", "hogi", "wala", "wali",
     "aur", "bhi", "apna", "apni", "unka", "uska", "iska", "kitna", "kitni",
     "kaha", "khana", "paani", "ghar", "dost", "samajh", "pata", "matlab",
-    "namaste",
 }
 
 
@@ -914,17 +879,6 @@ def check_can_speak(guild, member):
     if not voice or not voice.channel or voice.channel.id != vc.channel.id:
         return None, None, "❌ You must be in my voice channel to do that."
     return get_state(guild.id), vc, None
-
-
-def speak_text(text: str, lang: str) -> str:
-    """Accent fix: Roman Hindi ko Devanagari me badlo, taaki Hindi voice sahi bole.
-
-    Sirf tab jab lang hindi ho aur text me Devanagari pehle se na ho.
-    English messages ko kabhi convert nahi karta.
-    """
-    if lang == "hi" and not DEVANAGARI_RE.search(text):
-        return to_devanagari(text)
-    return text
 
 
 def build_item(raw: str, state: GuildState):
