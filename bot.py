@@ -9,8 +9,8 @@ Discord Hindi/English TTS bot (free: edge-tts, no paid API).
 
 import asyncio
 import ctypes.util
-import importlib.metadata
 import base64
+import importlib.metadata
 import json
 import urllib.error
 import urllib.request
@@ -70,8 +70,9 @@ DAVE_WAIT_SECONDS = 15.0
 # minutes of silence even though the websocket stays connected and
 # /diag still shows can_encrypt=True. A 1s silent Opus packet every
 # 90s keeps that path alive. If the client is gone, reconnect instead.
-KEEPALIVE_INTERVAL_SECONDS = 90.0
+KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
+RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
 USER_WORDS_FILE = BASE_DIR / "user_words.json"
 # Words added from Discord with /dictionary add. They work immediately,
@@ -103,6 +104,8 @@ def save_user_words() -> None:
     except Exception as e:
         print(f"[dictionary] save failed: {e!r}")
 
+
+load_user_words()
 
 # ---------------------------------------------------------------------------
 # GitHub sync for /dictionary words.
@@ -182,8 +185,6 @@ def sync_user_words_to_github(action: str) -> str:
         return f"failed: {e}"
 
 
-load_user_words()
-# GitHub copy wins over the local file when both exist (it is the backup).
 _gh_count = load_user_words_from_github()
 if _gh_count:
     print(f"[dictionary] loaded {_gh_count} words from GitHub")
@@ -360,6 +361,8 @@ class GuildState:
         self.text_channel_id = None
         self.voice_channel_id = None
         self.last_spoke = 0.0
+        self.last_real_spoke = 0.0
+        self.reconnecting = False  # v3: our own keepalive reconnect, not a kick/leave
         self.keepalive_task = None
         self.keepalive_count = 0
         self.mode = "auto"
@@ -639,26 +642,39 @@ def silence_sources():
 
 
 async def reconnect_voice(guild, state) -> bool:
-    """Reconnect to the stored voice channel. Returns True if connected."""
+    """Reconnect to the stored voice channel. Returns True if connected.
+
+    v3: the disconnect fires on_voice_state_update for the bot itself,
+    which used to tear down the TTS worker + keepalive and clear the
+    queue — that is why v2's testtone worked (direct play) but queued
+    text never spoke. The reconnecting flag tells that handler to
+    leave the worker/queue alone, and we restart both here as a net.
+    """
     if state.voice_channel_id is None:
         return False
     channel = guild.get_channel(state.voice_channel_id)
     if channel is None:
         return False
-    vc = guild.voice_client
-    if vc is not None:
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
+    state.reconnecting = True
     try:
-        await connect_self_deaf(channel)
-    except Exception as e:
-        print(f"[keepalive] reconnect failed: {e!r}")
-        return False
-    state.dave_timed_out = False
-    print(f"[keepalive] reconnected to {channel}")
-    return True
+        vc = guild.voice_client
+        if vc is not None:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        try:
+            await connect_self_deaf(channel)
+        except Exception as e:
+            print(f"[keepalive] reconnect failed: {e!r}")
+            return False
+        state.dave_timed_out = False
+        print(f"[keepalive] reconnected to {channel}")
+        ensure_worker(guild.id)
+        ensure_keepalive(guild.id)
+        return True
+    finally:
+        state.reconnecting = False
 
 
 async def voice_keepalive_loop(guild_id: int):
@@ -679,12 +695,22 @@ async def voice_keepalive_loop(guild_id: int):
                 return
             if vc.is_playing():
                 continue
+            # No real speech for 5 min: silent packets alone did not
+            # keep the media path alive (v1 proved that), so do a full
+            # disconnect + reconnect — fresh UDP + fresh DAVE session.
+            idle_for = time.time() - (state.last_real_spoke or state.last_spoke or time.time())
+            if idle_for >= RECONNECT_IDLE_SECONDS:
+                print(f"[keepalive] idle {idle_for:.0f}s, full reconnect")
+                async with state.play_lock:
+                    if await reconnect_voice(guild, state):
+                        state.last_real_spoke = time.time()
+                        state.last_spoke = time.time()
+                continue
             async with state.play_lock:
                 if vc.is_playing():
                     continue
                 ok = await play_with_fallback(vc, *silence_sources())
                 state.keepalive_count += 1
-                state.last_spoke = time.time()
                 print(f"[keepalive] silent packet sent, ok={ok}, "
                       f"latency={getattr(vc, 'latency', None)}")
     except asyncio.CancelledError:
@@ -750,6 +776,7 @@ async def tts_worker(guild_id: int):
                     ok = await play_with_fallback(vc, make_opus, make_pcm)
                     if ok:
                         state.last_spoke = time.time()
+                        state.last_real_spoke = time.time()
                     if not ok:
                         print("[audio] Could not play this message.")
             except asyncio.CancelledError:
@@ -866,6 +893,7 @@ async def do_join(guild: discord.Guild, member, text_channel) -> str:
 
         state.dave_timed_out = False
         state.last_spoke = time.time()
+        state.last_real_spoke = time.time()
         ensure_worker(guild.id)
         ensure_keepalive(guild.id)
         asyncio.create_task(log_dave_progress(vc))
@@ -912,9 +940,9 @@ def build_item(raw: str, state: GuildState):
         lang = "en"
     else:
         lang = detect_language(text)
-    # Accent fix: single entry point — /say, !say and VC chat all go
-    # through build_item -> enqueue_text, so converting here covers all.
-    text = speak_text(text, lang)
+        # Accent fix: single entry point — /say, !say and VC chat all go
+        # through build_item -> enqueue_text, so converting here covers all.
+        text = speak_text(text, lang)
     return text, lang
 
 
@@ -936,6 +964,7 @@ async def run_tone(guild, state, vc) -> bool:
         ok = await play_with_fallback(vc, make_opus, make_pcm)
         if ok:
             state.last_spoke = time.time()
+            state.last_real_spoke = time.time()
         return ok
 
 
@@ -1297,6 +1326,10 @@ async def on_voice_state_update(member, before, after):
     if before.channel is not None and after.channel is None:
         # The bot left voice (kicked, moved out, or /leave). Clean up quietly.
         state = states.get(member.guild.id)
+        if state and state.reconnecting:
+            # v3: this disconnect is our own keepalive reconnect — the
+            # worker, queue and keepalive must survive it.
+            return
         if state:
             state.generation += 1
             state.clear_queue()
