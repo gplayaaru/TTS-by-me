@@ -290,18 +290,7 @@ EMOJI_RE = re.compile(
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 LANG_PREFIX_RE = re.compile(r"^\s*(hi|en)\s*:\s*", re.I)
 
-HINDI_ROMAN_WORDS = {
-    "kaise", "kaisa", "kaisi", "ho", "tum", "tumhe", "tumhara", "tumhari",
-    "mera", "meri", "mere", "hai", "hain", "nahi", "nahin", "kya", "aaj",
-    "bahut", "accha", "acha", "achha", "raha", "rahi", "rahe", "gaya",
-    "gayi", "gaye", "mujhe", "mujhko", "aap", "kaun", "kyun", "kyu", "kab",
-    "kahan", "kahaan", "mein", "hum", "humko", "yaar", "bhai", "theek",
-    "thik", "karo", "karna", "kar", "abhi", "chalo", "bolo", "sab", "kuch",
-    "koi", "lekin", "toh", "tha", "thi", "hoga", "hogi", "wala", "wali",
-    "aur", "bhi", "apna", "apni", "unka", "uska", "iska", "kitna", "kitni",
-    "kaha", "khana", "paani", "ghar", "dost", "samajh", "pata", "matlab",
-    "namaste",
-}
+from dictionary import HINDI_ROMAN_WORDS  # single source of truth: see dictionary.py
 
 
 def split_lang_prefix(text: str):
@@ -1172,6 +1161,7 @@ async def dict_add(ctx: discord.ApplicationContext, word: str, meaning: str):
         meaning = to_devanagari(meaning.lower())
     WORD_MAP[word] = meaning
     USER_WORDS[word] = meaning
+    HINDI_ROMAN_WORDS.add(word)  # so the word is detected as Hindi too
     save_user_words()
     sync = sync_user_words_to_github(f"add {word}")
     if sync == "ok":

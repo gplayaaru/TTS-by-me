@@ -29,70 +29,7 @@ import re
 # 1. Dictionary: hand-checked spellings for the most common words.
 #    (Covers the bot's ROMAN_HINDI_WORDS list plus other frequent words.)
 # ---------------------------------------------------------------------------
-WORD_MAP = {
-    # pronouns / people
-    "main": "मैं", "mein": "मैं", "tum": "तुम", "tu": "तू", "aap": "आप",
-    "hum": "हम", "mera": "मेरा", "meri": "मेरी", "mere": "मेरे",
-    "tumhara": "तुम्हारा", "tumhari": "तुम्हारी", "tumhare": "तुम्हारे",
-    "aapka": "आपका", "aapki": "आपकी", "hamara": "हमारा", "hamari": "हमारी",
-    "mujhe": "मुझे", "tujhe": "तुझे", "usko": "उसको", "isko": "इसको",
-    "unko": "उनको", "inko": "इनको", "use": "उसे", "ise": "इसे",
-    "bhai": "भाई", "dost": "दोस्त", "yaar": "यार", "arre": "अरे",
-    # question words
-    "kya": "क्या", "kyu": "क्यों", "kyun": "क्यों", "kyunki": "क्योंकि",
-    "kab": "कब", "kahan": "कहाँ", "kaun": "कौन", "kaise": "कैसे",
-    "kaisa": "कैसा", "kaisi": "कैसी", "kitna": "कितना", "kitni": "कितनी",
-    "kitne": "कितने",
-    # verbs / auxiliaries
-    "hai": "है", "hain": "हैं", "ho": "हो", "hun": "हूँ", "hoon": "हूँ",
-    "tha": "था", "thi": "थी", "the": "थे", "hoga": "होगा", "hogi": "होगी",
-    "honge": "होंगे", "kar": "कर", "karo": "करो", "karna": "करना",
-    "karta": "करता", "karti": "करती", "karte": "करते",
-    "raha": "रहा", "rahi": "रही", "rahe": "रहे", "gaya": "गया",
-    "gayi": "गई", "gaye": "गए", "aaya": "आया", "aayi": "आई", "aaye": "आए",
-    "chahiye": "चाहिए", "sakta": "सकता", "sakti": "सकती", "sakte": "सकते",
-    "bolo": "बोलो", "suno": "सुनो", "dekho": "देखो", "batao": "बताओ",
-    "samajh": "समझ", "bata": "बता", "sun": "सुन", "dekh": "देख",
-    "khelo": "खेलो", "khelna": "खेलना",
-    "kha": "खा", "khao": "खाओ", "khana": "खाना", "khaana": "खाना",
-    "ja": "जा", "jao": "जाओ", "jana": "जाना", "aa": "आ", "aao": "आओ",
-    "aana": "आना", "so": "सो", "sona": "सोना",
-    "uth": "उठ", "utho": "उठो", "chal": "चल", "chalo": "चलो",
-    # adjectives / adverbs
-    "accha": "अच्छा", "acha": "अच्छा", "achha": "अच्छा", "bura": "बुरा",
-    "theek": "ठीक", "sahi": "सही", "galat": "गलत", "bahut": "बहुत",
-    "bohot": "बहुत", "zyada": "ज़्यादा", "kam": "कम", "bada": "बड़ा",
-    "badi": "बड़ी", "chota": "छोटा", "choti": "छोटी",
-    "abhi": "अभी", "phir": "फिर", "fir": "फिर", "jab": "जब", "tab": "तब",
-    "aaj": "आज", "kal": "कल", "subah": "सुबह", "shaam": "शाम",
-    "raat": "रात", "baat": "बात", "sab": "सब", "kuch": "कुछ",
-    "koi": "कोई", "aur": "और", "lekin": "लेकिन", "magar": "मगर",
-    "bhi": "भी", "liye": "लिए", "saath": "साथ", "bina": "बिना",
-    "baad": "बाद", "pehle": "पहले", "andar": "अंदर", "bahar": "बाहर",
-    "upar": "ऊपर", "neeche": "नीचे", "yeh": "ये", "ye": "ये",
-    "woh": "वो", "wo": "वो", "yahan": "यहाँ", "wahan": "वहाँ",
-    "nahi": "नहीं", "mat": "मत", "bas": "बस", "ek": "एक", "do": "दो",
-    "teen": "तीन", "naam": "नाम", "kaam": "काम", "ghar": "घर",
-    "paani": "पानी", "paisa": "पैसा", "time": "टाइम", "game": "गेम",
-    "song": "सॉन्ग", "gaana": "गाना", "gana": "गाना",
-    "school": "स्कूल", "bacha": "बच्चा", "bachi": "बच्ची",
-    "ladka": "लड़का", "ladki": "लड़की",
-    "aaina": "आईना", "aaiye": "आइए",
-
-    # User's typing style (short forms, from his chats — 2026-11-19).
-    # He drops vowels / shortens endings: kr, kro, btao, smjh, thik, hn.
-    "hn": "हाँ", "thik": "ठीक", "kro": "करो", "kr": "कर",
-    "krna": "करना", "krta": "करता", "krte": "करते",
-    "btao": "बताओ", "bta": "बता", "smjh": "समझ",
-    "aabhe": "अभी", "abhe": "अभी", "aab": "अब",
-    "ese": "ऐसे", "eese": "ऐसे", "aise": "ऐसे", "hi": "ही",
-    "mai": "मैं", "rhe": "रहे", "rha": "रहा", "rhi": "रही",
-    "jaise": "जैसे", "vaise": "वैसे", "kese": "कैसे",
-    "gya": "गया", "gyi": "गई", "gye": "गए",
-    "lga": "लगा", "lg": "लग", "lagana": "लगाना",
-    "pata": "पता", "pta": "पता", "kb": "कब",
-    "dekhna": "देखना", "krne": "करने", "hoga": "होगा",
-}
+from dictionary import WORD_MAP  # single source of truth: see dictionary.py
 
 # ---------------------------------------------------------------------------
 # 2. Phonetic fallback (ITRANS-style). Longest match first.
