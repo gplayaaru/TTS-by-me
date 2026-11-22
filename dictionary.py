@@ -83,7 +83,10 @@ WORD_MAP = {
     # 2026-11-22: "nhi" fell to the phonetic fallback and came out as
     # "ंहि"; "hu" came out as "हु" instead of "हूँ".
     "nhi": "नहीं", "hu": "हूँ",
-    "ooye": "ओए", "namaste": "नमस्ते", "bsdk": "भोसडीके", "wdym": "व्हाट डू यू मीन", "bkl": "बहन के लोड़े",
+    "ooye": "ओए", "namaste": "नमस्ते",
+
+    # added by me
+    "bsdk": "भोसडीके", "wdym": "व्हाट डू यू मीन", "bkl": "बहन के लोड़े"
 }
 
 # Words that only help detection (no fixed Devanagari meaning needed).
