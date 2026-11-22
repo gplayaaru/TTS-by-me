@@ -72,7 +72,6 @@ DAVE_WAIT_SECONDS = 15.0
 # 90s keeps that path alive. If the client is gone, reconnect instead.
 KEEPALIVE_INTERVAL_SECONDS = 20.0
 KEEPALIVE_SILENCE_SECONDS = 1
-RECONNECT_IDLE_SECONDS = 300.0  # 5 min no real speech -> full reconnect
 LAST_TTS = BASE_DIR / "last_tts.mp3"
 USER_WORDS_FILE = BASE_DIR / "user_words.json"
 # Words added from Discord with /dictionary add. They work immediately,
@@ -667,7 +666,7 @@ async def reconnect_voice(guild, state) -> bool:
 
 
 async def voice_keepalive_loop(guild_id: int):
-    """While in VC, send 1s silence every 90s so the media path survives idle."""
+    """While in VC, send 1s silence every 20s so the media path survives idle."""
     state = get_state(guild_id)
     print(f"[keepalive] started for guild {guild_id}")
     try:
@@ -684,17 +683,12 @@ async def voice_keepalive_loop(guild_id: int):
                 return
             if vc.is_playing():
                 continue
-            # No real speech for 5 min: silent packets alone did not
-            # keep the media path alive (v1 proved that), so do a full
-            # disconnect + reconnect — fresh UDP + fresh DAVE session.
-            idle_for = time.time() - (state.last_real_spoke or state.last_spoke or time.time())
-            if idle_for >= RECONNECT_IDLE_SECONDS:
-                print(f"[keepalive] idle {idle_for:.0f}s, full reconnect")
-                async with state.play_lock:
-                    if await reconnect_voice(guild, state):
-                        state.last_real_spoke = time.time()
-                        state.last_spoke = time.time()
-                continue
+            # v4: NO timer-based reconnect any more. The 5-min full
+            # reconnect was the rejoin sound the user hears every 5-10
+            # min — Discord plays its join sound on every reconnect.
+            # The 20s silent packets keep the media path alive instead;
+            # reconnect_voice is kept only for when the voice client is
+            # actually gone (see the check above).
             async with state.play_lock:
                 if vc.is_playing():
                     continue
