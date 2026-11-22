@@ -301,6 +301,12 @@ HINDI_ROMAN_WORDS = {
     "aur", "bhi", "apna", "apni", "unka", "uska", "iska", "kitna", "kitni",
     "kaha", "khana", "paani", "ghar", "dost", "samajh", "pata", "matlab",
     "namaste",
+    # User's short forms (2026-11-22): without these, "Mai kuch nhi kr rha
+    # hu" scores only 1 Hindi hit (kuch) and is detected as English, so
+    # speak_text never runs and the voice spells "kr" as K R.
+    "mai", "kr", "kro", "krna", "krta", "krte", "krne", "rhe", "rha", "rhi",
+    "nhi", "hn", "btao", "bta", "smjh", "thik", "kese", "gya", "gyi", "gye",
+    "pta", "kb", "ese", "aise", "aabhe", "abhe", "hu", "hun", "ooye",
 }
 
 
@@ -1172,6 +1178,7 @@ async def dict_add(ctx: discord.ApplicationContext, word: str, meaning: str):
         meaning = to_devanagari(meaning.lower())
     WORD_MAP[word] = meaning
     USER_WORDS[word] = meaning
+    HINDI_ROMAN_WORDS.add(word)  # so the word is detected as Hindi too
     save_user_words()
     sync = sync_user_words_to_github(f"add {word}")
     if sync == "ok":

@@ -92,6 +92,9 @@ WORD_MAP = {
     "lga": "लगा", "lg": "लग", "lagana": "लगाना",
     "pata": "पता", "pta": "पता", "kb": "कब",
     "dekhna": "देखना", "krne": "करने", "hoga": "होगा",
+    # 2026-11-22: "nhi" fell to the phonetic fallback and came out as
+    # "ंहि"; "hu" came out as "हु" instead of "हूँ".
+    "nhi": "नहीं", "hu": "हूँ",
 }
 
 # ---------------------------------------------------------------------------
