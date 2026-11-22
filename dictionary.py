@@ -82,6 +82,9 @@ WORD_MAP = {
     # "ंहि"; "hu" came out as "हु" instead of "हूँ".
     "nhi": "नहीं", "hu": "हूँ",
     "ooye": "ओए", "namaste": "नमस्ते",
+
+    # added by me
+    "bsdk": "भोसडीके"
 }
 
 # Words that only help detection (no fixed Devanagari meaning needed).
