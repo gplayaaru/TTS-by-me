@@ -84,7 +84,7 @@ WORD_MAP = {
     "ooye": "ओए", "namaste": "नमस्ते",
 
     # added by me
-    "bsdk": "भोसडीके", "wdym": "व्हाट डू यू मीन", "bkl": "बहन के लोड़े"
+    "bsdk": "भोसडीके", "wdym": "व्हाट डू यू मीन", "bkl": "बहन के लोड़े", "h": "है"
 }
 
 # Words that only help detection (no fixed Devanagari meaning needed).
